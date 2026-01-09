@@ -1,0 +1,43 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+
+# Solidity compiler settings
+solc_version = "0.8.20"
+evm_version = "shanghai"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+
+# Testing settings
+verbosity = 3
+fuzz = { runs = 256 }
+invariant = { runs = 256, depth = 15 }
+
+# Gas reporting
+gas_reports = ["*"]
+gas_reports_ignore = []
+
+# Formatting
+line_length = 120
+tab_width = 4
+bracket_spacing = true
+int_types = "long"
+multiline_func_header = "attributes_first"
+quote_style = "double"
+number_underscore = "thousands"
+
+# RPC endpoints
+[rpc_endpoints]
+mantle_testnet = "https://rpc.testnet.mantle.xyz"
+mantle_mainnet = "https://rpc.mantle.xyz"
+
+# Etherscan verification
+[etherscan]
+mantle_testnet = { key = "${MANTLE_EXPLORER_API_KEY}", url = "https://explorer.testnet.mantle.xyz/api" }
+mantle_mainnet = { key = "${MANTLE_EXPLORER_API_KEY}", url = "https://explorer.mantle.xyz/api" }
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
