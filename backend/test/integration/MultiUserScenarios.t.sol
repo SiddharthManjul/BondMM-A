@@ -221,6 +221,7 @@ contract MultiUserScenarios is Test {
 
         // Warp to maturity
         vm.warp(block.timestamp + 90 days);
+        oracle.updateRate(INITIAL_RATE); // Update oracle after time warp
 
         // Lender should still be able to redeem
         vm.prank(users[0]);
@@ -254,6 +255,7 @@ contract MultiUserScenarios is Test {
 
         // Step 4: Warp to maturity
         vm.warp(maturity);
+        oracle.updateRate(INITIAL_RATE); // Update oracle after time warp
 
         // Step 5: User 1 repays borrow
         IBondMMA.Position memory borrowPos = bondMMA.getPosition(borrowPositionId);
@@ -329,6 +331,7 @@ contract MultiUserScenarios is Test {
 
         // Warp to maturity
         vm.warp(maturity);
+        oracle.updateRate(INITIAL_RATE); // Update oracle after time warp
 
         // Redeem in reverse order
         vm.prank(users[2]);
