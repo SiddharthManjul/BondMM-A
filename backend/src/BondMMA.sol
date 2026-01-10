@@ -5,6 +5,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {UD60x18, ud, intoUint256} from "@prb/math/src/UD60x18.sol";
 
 import {BondMMMath} from "./libraries/BondMMMath.sol";
 import {IBondMMA} from "./interfaces/IBondMMA.sol";
@@ -24,6 +25,7 @@ import {IOracle} from "./interfaces/IOracle.sol";
  */
 contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
+    using {intoUint256} for UD60x18;
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -40,6 +42,9 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
 
     /// @notice Initial cash deposited (y₀) - used for solvency check
     uint256 public initialCash;
+
+    /// @notice Last time liabilities were updated (for decay calculation)
+    uint256 public lastUpdateTime;
 
     /// @notice Counter for position IDs
     uint256 public nextPositionId;
@@ -76,6 +81,12 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
     /// @notice Solvency threshold: 99% of initial cash
     uint256 public constant SOLVENCY_THRESHOLD = 99;
 
+    /// @notice Grace period after maturity before liquidation (24 hours)
+    uint256 public constant GRACE_PERIOD = 24 hours;
+
+    /// @notice Liquidation penalty: 5%
+    uint256 public constant LIQUIDATION_PENALTY = 5;
+
     /// @notice Precision scale
     uint256 public constant PRECISION = 1e18;
 
@@ -107,6 +118,7 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
         initialCash = _initialCash;
         pvBonds = _initialCash; // X₀ = y₀
         netLiabilities = 0;
+        lastUpdateTime = block.timestamp; // Initialize liability decay tracking
         nextPositionId = 1; // Start IDs from 1
 
         // Set contracts
@@ -159,6 +171,56 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
     }
 
     /*//////////////////////////////////////////////////////////////
+                        INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Update netLiabilities based on time elapsed
+     * @dev Implements liability decay: L(t+Δt) = L(t) · e^(r·Δt)
+     *      This ensures liabilities grow with interest over time
+     *
+     * Formula from paper (Section III):
+     *   d ln L = r dt
+     *   => L(t+Δt) = L(t) · e^(r·Δt)
+     *
+     * @custom:security Called before any operation that checks solvency or modifies state
+     */
+    function updateLiabilities() internal {
+        // Skip if no liabilities or no time passed
+        if (netLiabilities == 0 || block.timestamp == lastUpdateTime) {
+            return;
+        }
+
+        // Skip if oracle is stale (fallback to avoid reverting entire transaction)
+        // This is safe because lend/borrow will check oracle staleness separately
+        if (oracle.isStale()) {
+            lastUpdateTime = block.timestamp; // Update timestamp to prevent perpetual staleness
+            return;
+        }
+
+        // Calculate time elapsed (in years, for rate calculation)
+        uint256 timeElapsed = block.timestamp - lastUpdateTime;
+
+        // Get current rate
+        uint256 anchorRate = oracle.getRate();
+        uint256 currentRate = BondMMMath.calculateRate(pvBonds, cash, anchorRate);
+
+        // Calculate growth factor: e^(r·Δt)
+        // Convert timeElapsed to annualized: Δt_years = Δt / SECONDS_PER_YEAR
+        // exponent = r · Δt_years = r · (Δt / SECONDS_PER_YEAR)
+        uint256 exponent = (currentRate * timeElapsed) / BondMMMath.SECONDS_PER_YEAR;
+
+        // Calculate e^exponent using PRBMath
+        UD60x18 growthFactor = ud(exponent).exp();
+
+        // Update liabilities: L_new = L_old · e^(r·Δt)
+        netLiabilities = (netLiabilities * growthFactor.intoUint256()) / PRECISION;
+
+        // Update timestamp
+        lastUpdateTime = block.timestamp;
+    }
+
+    /*//////////////////////////////////////////////////////////////
                             VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
@@ -206,6 +268,9 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
         requireSolvency
         returns (uint256 positionId)
     {
+        // Update liabilities with time decay before any state changes
+        updateLiabilities();
+
         // Validate inputs
         require(amount > 0, "Amount must be > 0");
         require(maturity > block.timestamp, "Maturity must be in future");
@@ -247,6 +312,7 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
             maturity: maturity,
             collateral: 0, // No collateral for lending positions
             initialPV: DeltaPV, // Store initial present value
+            createdAt: block.timestamp, // Track creation time for liability decay
             isBorrow: false,
             isActive: true
         });
@@ -269,6 +335,9 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
         onlyInitialized
         returns (uint256 positionId)
     {
+        // Update liabilities with time decay before any state changes
+        updateLiabilities();
+
         // Validate inputs
         require(amount > 0, "Amount must be > 0");
         require(maturity > block.timestamp, "Maturity must be in future");
@@ -321,6 +390,7 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
             maturity: maturity,
             collateral: collateral,
             initialPV: DeltaPV, // Store initial present value
+            createdAt: block.timestamp, // Track creation time for liability decay
             isBorrow: true,
             isActive: true
         });
@@ -333,6 +403,9 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
      * @param positionId ID of the position to redeem
      */
     function redeem(uint256 positionId) external nonReentrant onlyInitialized {
+        // Update liabilities with time decay before any state changes
+        updateLiabilities();
+
         // Get position
         IBondMMA.Position storage position = positions[positionId];
 
@@ -366,6 +439,9 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
      * @param positionId ID of the position to repay
      */
     function repay(uint256 positionId) external nonReentrant onlyInitialized {
+        // Update liabilities with time decay before any state changes
+        updateLiabilities();
+
         // Get position
         IBondMMA.Position storage position = positions[positionId];
 
@@ -396,10 +472,19 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
             currentPV = repayAmount;
         }
 
+        // Calculate grown liability value to subtract from netLiabilities
+        // Liability has grown since creation: currentLiability = initialPV * e^(r·Δt)
+        uint256 timeElapsed = block.timestamp - position.createdAt;
+        uint256 currentAnchorRate = oracle.getRate();
+        uint256 avgRate = BondMMMath.calculateRate(pvBonds, cash, currentAnchorRate);
+        uint256 exponent = (avgRate * timeElapsed) / BondMMMath.SECONDS_PER_YEAR;
+        UD60x18 growthFactor = ud(exponent).exp();
+        uint256 grownLiability = (position.initialPV * growthFactor.intoUint256()) / PRECISION;
+
         // Update pool state
         cash += repayAmount; // Pool receives repayment
         pvBonds -= currentPV; // Remove bond claim from pool
-        netLiabilities -= position.initialPV; // Reduce by original PV that was added
+        netLiabilities -= grownLiability; // Reduce by grown value of liability
 
         // Burn position
         position.isActive = false;
@@ -411,5 +496,72 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
         stablecoin.safeTransfer(msg.sender, position.collateral);
 
         emit Repay(positionId, msg.sender, repayAmount, position.collateral);
+    }
+
+    /**
+     * @notice Liquidate a defaulted borrow position
+     * @dev Can be called by anyone after maturity + grace period
+     * @param positionId ID of the position to liquidate
+     *
+     * Requirements:
+     * - Position must be active borrow position
+     * - Must be past maturity + grace period
+     *
+     * Process:
+     * 1. Calculate total debt (face value + 5% penalty)
+     * 2. Seize collateral
+     * 3. Add collateral to pool cash
+     * 4. Reduce netLiabilities by grown liability value
+     * 5. Burn position
+     * 6. Emit Liquidated event
+     */
+    function liquidate(uint256 positionId) external nonReentrant onlyInitialized {
+        // Update liabilities with time decay before any state changes
+        updateLiabilities();
+
+        // Get position
+        IBondMMA.Position storage position = positions[positionId];
+
+        // Validate position
+        require(position.isActive, "Position not active");
+        require(position.isBorrow, "Not a borrow position");
+        require(
+            block.timestamp > position.maturity + GRACE_PERIOD,
+            "Grace period not expired"
+        );
+
+        // Calculate debt owed: face value + 5% penalty
+        uint256 debt = position.faceValue;
+        uint256 penalty = (debt * LIQUIDATION_PENALTY) / 100;
+        uint256 totalOwed = debt + penalty;
+
+        // Seize all collateral
+        uint256 collateralSeized = position.collateral;
+
+        // Calculate grown liability value to subtract from netLiabilities
+        // Same calculation as in repay()
+        uint256 timeElapsed = block.timestamp - position.createdAt;
+        uint256 currentAnchorRate = oracle.getRate();
+        uint256 avgRate = BondMMMath.calculateRate(pvBonds, cash, currentAnchorRate);
+        uint256 exponent = (avgRate * timeElapsed) / BondMMMath.SECONDS_PER_YEAR;
+        UD60x18 growthFactor = ud(exponent).exp();
+        uint256 grownLiability = (position.initialPV * growthFactor.intoUint256()) / PRECISION;
+
+        // Update pool state
+        cash += collateralSeized; // Pool receives seized collateral
+        pvBonds -= position.faceValue; // Remove bond claim (face value since at/past maturity)
+        netLiabilities -= grownLiability; // Reduce by grown value of liability
+
+        // Burn position
+        position.isActive = false;
+
+        emit Liquidated(
+            positionId,
+            position.owner,
+            msg.sender,
+            totalOwed,
+            collateralSeized,
+            penalty
+        );
     }
 }
