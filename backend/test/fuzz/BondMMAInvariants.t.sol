@@ -367,6 +367,7 @@ contract BondMMAInvariants is Test {
 
         // Warp to maturity
         vm.warp(maturity);
+        oracle.updateRate(INITIAL_RATE); // Update oracle after time warp
 
         // Get position details
         IBondMMA.Position memory pos = bondMMA.getPosition(positionId);
@@ -403,6 +404,7 @@ contract BondMMAInvariants is Test {
 
         // Warp to maturity
         vm.warp(maturity);
+        oracle.updateRate(INITIAL_RATE); // Update oracle after time warp
 
         // Mint repayment tokens
         stablecoin.mint(user1, faceValue);
