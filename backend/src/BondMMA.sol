@@ -246,6 +246,7 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
             faceValue: deltaX,
             maturity: maturity,
             collateral: 0, // No collateral for lending positions
+            initialPV: DeltaPV, // Store initial present value
             isBorrow: false,
             isActive: true
         });
@@ -319,6 +320,7 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
             faceValue: deltaX,
             maturity: maturity,
             collateral: collateral,
+            initialPV: DeltaPV, // Store initial present value
             isBorrow: true,
             isActive: true
         });
@@ -331,9 +333,32 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
      * @param positionId ID of the position to redeem
      */
     function redeem(uint256 positionId) external nonReentrant onlyInitialized {
-        positionId; // Silence unused variable warning
-        // To be implemented in Phase 5
-        revert("Not yet implemented");
+        // Get position
+        IBondMMA.Position storage position = positions[positionId];
+
+        // Validate position
+        require(position.isActive, "Position not active");
+        require(position.owner == msg.sender, "Not position owner");
+        require(!position.isBorrow, "Cannot redeem borrow position");
+        require(block.timestamp >= position.maturity, "Not yet mature");
+
+        // At maturity: 1 bond = 1 cash (price = 1.0)
+        uint256 cashAmount = position.faceValue;
+
+        // Update pool state
+        cash -= cashAmount; // Pool pays out face value
+
+        // Calculate PV to add back to pvBonds (we're removing the liability)
+        // At maturity, price = 1, so PV = faceValue
+        pvBonds += position.faceValue;
+
+        // Burn position
+        position.isActive = false;
+
+        // Transfer cash to lender
+        stablecoin.safeTransfer(msg.sender, cashAmount);
+
+        emit Redeem(positionId, msg.sender, cashAmount);
     }
 
     /**
@@ -341,8 +366,50 @@ contract BondMMA is IBondMMA, ReentrancyGuard, Ownable {
      * @param positionId ID of the position to repay
      */
     function repay(uint256 positionId) external nonReentrant onlyInitialized {
-        positionId; // Silence unused variable warning
-        // To be implemented in Phase 5
-        revert("Not yet implemented");
+        // Get position
+        IBondMMA.Position storage position = positions[positionId];
+
+        // Validate position
+        require(position.isActive, "Position not active");
+        require(position.owner == msg.sender, "Not position owner");
+        require(position.isBorrow, "Not a borrow position");
+
+        uint256 repayAmount;
+        uint256 timeToMaturity;
+        uint256 currentPV;
+
+        if (block.timestamp >= position.maturity) {
+            // At maturity: repay face value (1:1)
+            repayAmount = position.faceValue;
+            currentPV = position.faceValue; // price = 1 at maturity
+        } else {
+            // Before maturity: repay present value
+            timeToMaturity = position.maturity - block.timestamp;
+
+            // Calculate current rate and price
+            uint256 anchorRate = oracle.getRate();
+            uint256 currentRate = BondMMMath.calculateRate(pvBonds, cash, anchorRate);
+            uint256 price = BondMMMath.calculatePrice(timeToMaturity, currentRate);
+
+            // Calculate repayment amount (present value)
+            repayAmount = (position.faceValue * price) / PRECISION;
+            currentPV = repayAmount;
+        }
+
+        // Update pool state
+        cash += repayAmount; // Pool receives repayment
+        pvBonds -= currentPV; // Remove bond claim from pool
+        netLiabilities -= position.initialPV; // Reduce by original PV that was added
+
+        // Burn position
+        position.isActive = false;
+
+        // Transfer repayment from borrower to pool
+        stablecoin.safeTransferFrom(msg.sender, address(this), repayAmount);
+
+        // Return collateral to borrower
+        stablecoin.safeTransfer(msg.sender, position.collateral);
+
+        emit Repay(positionId, msg.sender, repayAmount, position.collateral);
     }
 }
